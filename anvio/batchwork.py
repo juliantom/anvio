@@ -37,7 +37,6 @@ class AnvioBatchWork():
         
         A = lambda x: args.__dict__[x] if x in args.__dict__ else None
         self.yaml_file_path = A('yaml')
-        self.setup_arg = A('setup')
         self.given_work_dir = A('work_directory')
         self.contigs_db_path = A('contigs_db')
         self.profile_db_path = A('profile_db')
@@ -64,39 +63,32 @@ class AnvioBatchWork():
         if self.contigs_db_path or self.profile_db_path or self.pan_db_path:
             raise ConfigError("You should remove all the db_paths (CONTIGS.db, PROFILE.db...) to run this command. :/")
 
-
-    def execute(self):
-        """This function is used to run the commands in the yaml file."""
-
-        self.run.info('Project Title', self.yaml_file.get('project').get('title'), mc='green', nl_before= 1)
-        self.run.info('Project Description', self.yaml_file.get('project').get('description'), mc='green')
-        self.run.info('Author Name', self.yaml_file.get('author').get('name'), mc='green')
-        self.run.info('Author Email', self.yaml_file.get('author').get('email'), mc='green')
-        self.run.info('Author Affiliation', self.yaml_file.get('author').get('affiliation'), mc='green')
-        self.run.info('Author Web', self.yaml_file.get('author').get('web'), mc='green')
+    def work_dir(self):
+        if not self.yaml_file.get('work_directory'):
+            raise ConfigError('You must give your Working Directory!!')
 
         #Trimming working directory.
         work_dir = re.sub('^[a-z0-9](?!.*?[^\na-z0-9]{2}).*?[a-z0-9]$', '', self.yaml_file.get('work_directory'))
-        
+        return work_dir
+
+    def setup_commands(self):
         setup = self.yaml_file.get('setup')
         setup_command_counter = 0
-        cwd = os.getcwd()
-        unix_commands = ['cd','rm', 'ls', 'll', 'pwd', 'cat', 'mkdir', 'cp', 'mv', 'rmdir']
 
-        if not work_dir:
-            raise ConfigError('You must give your Working Directory!!')
+        while setup_command_counter < len(setup):
+            if 'cd' in setup[setup_command_counter]:
+                self.run.warning('You should remove "cd" commands in your yaml file')
+                sys.exit(-1)
+            else:
+                subprocess.run(str(setup[setup_command_counter]), shell=True)
+                setup_command_counter += 1     
 
-        if self.setup_arg:
-            while setup_command_counter < len(setup):
-                if 'cd' in setup[setup_command_counter]:
-                    self.run.warning('You should remove "cd" commands in your yaml file')
-                    sys.exit(-1)
-                else:
-                    subprocess.run(str(setup[setup_command_counter]), shell=True)
-                    setup_command_counter += 1
-                    
+    def run_commands(self):
+        work_dir = self.work_dir()
+
         running_command = self.yaml_file.get('run')
         run_command_counter = 0
+        cwd = os.getcwd()
 
         #Change directory anyway!
         cwd_file = cwd + '/' + work_dir
@@ -107,7 +99,24 @@ class AnvioBatchWork():
 
         while run_command_counter < len(running_command):
             subprocess.call(running_command[run_command_counter].get('command'), shell=True)
-            run_command_counter += 1            
+            run_command_counter += 1      
 
+    def execute(self):
+        """This function is used to run the commands in the yaml file."""
+
+        self.run.info('Project Title', self.yaml_file.get('project').get('title'), mc='green', nl_before= 1)
+        self.run.info('Project Description', self.yaml_file.get('project').get('description'), mc='green')
+        self.run.info('Author Name', self.yaml_file.get('author').get('name'), mc='green')
+        self.run.info('Author Email', self.yaml_file.get('author').get('email'), mc='green')
+        self.run.info('Author Affiliation', self.yaml_file.get('author').get('affiliation'), mc='green')
+        self.run.info('Author Web', self.yaml_file.get('author').get('web'), mc='green')
+        
+        try:
+            self.work_dir()
+            self.setup_commands()
+            self.run_commands()
+        except ConfigError as e:
+            print(e)
+            sys.exit(-1)        
 
 
