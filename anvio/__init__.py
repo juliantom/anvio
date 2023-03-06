@@ -3525,6 +3525,12 @@ D = {
                      "a comma-separated list. The default stats are 'detection' and "
                      "'mean_coverage_Q2Q3'. To see a list of available stats, use this flag "
                      "and provide an absolutely ridiculous string after it (we suggest 'cattywampus', but you do you)."}
+    ),
+    'yaml': (
+            ['--yaml', '-y', '--y'],
+            {'metavar': 'TEXT_FILE',
+             'required': True,
+             'help': "You have to provide a YAML file."}
     )
 }
 

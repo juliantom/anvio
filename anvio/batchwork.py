@@ -41,9 +41,13 @@ class AnvioBatchWork():
         self.contigs_db_path = A('contigs_db')
         self.profile_db_path = A('profile_db')
         self.pan_db_path = A('pan_db')
+        self.output_directory = A('output_dir')
+        self.reset = A('reset')
 
         if not skip_sanity_check:
             self.sanity_check()
+
+        self.output_dir()
 
         # Open and parse the file
         self.yaml_file = utils.get_yaml_as_dict(self.yaml_file_path)
@@ -62,6 +66,10 @@ class AnvioBatchWork():
 
         if self.contigs_db_path or self.profile_db_path or self.pan_db_path:
             raise ConfigError("You should remove all the db_paths (CONTIGS.db, PROFILE.db...) to run this command. :/")
+
+    def output_dir(self):
+        if not self.output_directory:
+            raise ConfigError("It seems you forgot to give some `output_directory` argument :/")
 
     def work_dir(self):
         if not self.yaml_file.get('work_directory'):
