@@ -36,7 +36,7 @@ if __name__ == '__main__':
     parser.add_argument(*anvio.A('yaml'), **anvio.K('yaml'))
     parser.add_argument(*anvio.A('output-dir'), **anvio.K('output-dir', {"help": "If you declare an output dir, all your data will be "
                             "stored in there, instead of being stored in a temporary directory to be deleted once the tests are done. "
-                            "This is particularly useful if you wish to play with general anvi'o output files"}), required=True)    
+                            "This is particularly useful if you wish to play with general anvi'o output files"}), required=False)    
     parser.add_argument(*anvio.A('reset'), **anvio.K('reset'))
     
     args = parser.get_args(parser)

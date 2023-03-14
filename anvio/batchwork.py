@@ -73,7 +73,6 @@ class AnvioBatchWork():
             filesnpaths.gen_output_directory(self.output_directory)
 
 
-
     def work_dir(self):
         if not self.yaml_file.get('work_directory'):
             raise ConfigError('You must give your Working Directory!!')
