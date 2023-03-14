@@ -89,6 +89,8 @@ class AnvioBatchWork():
 
 
     def setup_commands(self):
+        """ This function is used to setup the commands. """
+
         setup = self.yaml_file.get('setup')
         setup_command_counter = 0
         #If user give -o Output_Dir we will run under the directory
@@ -106,16 +108,13 @@ class AnvioBatchWork():
 
 
     def run_commands(self):
-        work_dir = self.work_dir()
+        """ This function is used to run the commands in the yaml file. """
 
+        work_dir = self.work_dir()
         running_command = self.yaml_file.get('run')
         run_command_counter = 0
-        cwd = os.getcwd()
-        #If user give -o Output_Dir we will run under the directory
-        if self.output_directory:
-            cwd_file = cwd + '/' + self.output_directory + '/' + work_dir
 
-        #Change directory anyway!
+        cwd = os.getcwd()
         cwd_file = cwd + '/' + work_dir
         os.chdir(cwd_file)
 
@@ -123,12 +122,15 @@ class AnvioBatchWork():
         subprocess.call('anvi-migrate --migrate-dbs-safely --migrate-safely *.db', shell=True)
 
         while run_command_counter < len(running_command):
-            subprocess.call(running_command[run_command_counter].get('command'), shell=True)
-            run_command_counter += 1      
-
+            try:
+                subprocess.call(running_command[run_command_counter].get('command'), shell=True)
+                run_command_counter += 1  
+            except ConfigError as e:
+                print(e)
+                sys.exit(-1)
 
     def execute(self):
-        """This function is used to run the commands in the yaml file."""
+        """This function is used to execute the batchwork.py"""
 
         self.run.info('Project Title', self.yaml_file.get('project').get('title'), mc='green')
         self.run.info('Project Description', self.yaml_file.get('project').get('description'), mc='green')
