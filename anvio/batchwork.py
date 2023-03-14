@@ -37,7 +37,6 @@ class AnvioBatchWork():
         
         A = lambda x: args.__dict__[x] if x in args.__dict__ else None
         self.yaml_file_path = A('yaml')
-        self.given_work_dir = A('work_directory')
         self.contigs_db_path = A('contigs_db')
         self.profile_db_path = A('profile_db')
         self.pan_db_path = A('pan_db')
@@ -52,9 +51,6 @@ class AnvioBatchWork():
         # Open and parse the file
         self.yaml_file = utils.get_yaml_as_dict(self.yaml_file_path)
 
-        # to be filled later if necessary
-        self.contigs_basic_info = {}
-
 
     def sanity_check(self):
         if not self.yaml_file_path:
@@ -67,9 +63,16 @@ class AnvioBatchWork():
         if self.contigs_db_path or self.profile_db_path or self.pan_db_path:
             raise ConfigError("You should remove all the db_paths (CONTIGS.db, PROFILE.db...) to run this command. :/")
 
+
     def output_dir(self):
-        if not self.output_directory:
-            raise ConfigError("It seems you forgot to give some `output_directory` argument :/")
+        #-o Output directory args is not required
+        self.run.info('Data directory', self.output_directory)
+        if self.output_directory:
+            filesnpaths.is_output_dir_writable(os.path.dirname(os.path.abspath(self.output_directory)))
+            filesnpaths.check_output_directory(self.output_directory)
+            filesnpaths.gen_output_directory(self.output_directory)
+
+
 
     def work_dir(self):
         if not self.yaml_file.get('work_directory'):
@@ -78,18 +81,30 @@ class AnvioBatchWork():
         #Trimming working directory.
         work_dir = re.sub('^[a-z0-9](?!.*?[^\na-z0-9]{2}).*?[a-z0-9]$', '', self.yaml_file.get('work_directory'))
         return work_dir
+    
+
+    def reset_dir(self):
+        self.run.info('Reset contents', self.reset, nl_after=1)
+        filesnpaths.is_output_dir_writable(os.path.dirname(os.path.abspath(self.output_directory)))
+        filesnpaths.gen_output_directory(self.output_directory, delete_if_exists=self.reset)
+
 
     def setup_commands(self):
         setup = self.yaml_file.get('setup')
         setup_command_counter = 0
+        #If user give -o Output_Dir we will run under the directory
+        if self.output_directory:
+            os.chdir(self.output_directory)
 
         while setup_command_counter < len(setup):
-            if 'cd' in setup[setup_command_counter]:
-                self.run.warning('You should remove "cd" commands in your yaml file')
-                sys.exit(-1)
-            else:
+            # In terminal use, we need to use `rm, cd commands`. But it is not secure in Anviserver. So we will check when the form is uploaded to the Anviserver.
+            try:
                 subprocess.run(str(setup[setup_command_counter]), shell=True)
-                setup_command_counter += 1     
+                setup_command_counter += 1   
+            except ConfigError as e:
+                print(e)
+                sys.exit(-1)
+
 
     def run_commands(self):
         work_dir = self.work_dir()
@@ -97,6 +112,9 @@ class AnvioBatchWork():
         running_command = self.yaml_file.get('run')
         run_command_counter = 0
         cwd = os.getcwd()
+        #If user give -o Output_Dir we will run under the directory
+        if self.output_directory:
+            cwd_file = cwd + '/' + self.output_directory + '/' + work_dir
 
         #Change directory anyway!
         cwd_file = cwd + '/' + work_dir
@@ -109,17 +127,20 @@ class AnvioBatchWork():
             subprocess.call(running_command[run_command_counter].get('command'), shell=True)
             run_command_counter += 1      
 
+
     def execute(self):
         """This function is used to run the commands in the yaml file."""
 
-        self.run.info('Project Title', self.yaml_file.get('project').get('title'), mc='green', nl_before= 1)
+        self.run.info('Project Title', self.yaml_file.get('project').get('title'), mc='green')
         self.run.info('Project Description', self.yaml_file.get('project').get('description'), mc='green')
         self.run.info('Author Name', self.yaml_file.get('author').get('name'), mc='green')
         self.run.info('Author Email', self.yaml_file.get('author').get('email'), mc='green')
         self.run.info('Author Affiliation', self.yaml_file.get('author').get('affiliation'), mc='green')
-        self.run.info('Author Web', self.yaml_file.get('author').get('web'), mc='green')
+        self.run.info('Author Web', self.yaml_file.get('author').get('web'), mc='green', nl_after=2)
         
         try:
+            if self.reset:
+                self.reset_dir()
             self.work_dir()
             self.setup_commands()
             self.run_commands()
