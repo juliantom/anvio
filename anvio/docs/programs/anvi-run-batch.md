@@ -20,7 +20,7 @@ You can run the code below;
 
 {{ codestart }}
 anvi-run-batch -y %(yaml)s \
-               -o OUTPUT_DIR \
+               -o OUTPUT_DIR/DATA_DIR \
                --reset --force-overwrite
 {{ codestop }}
 
