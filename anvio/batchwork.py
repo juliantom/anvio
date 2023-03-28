@@ -67,9 +67,8 @@ class AnvioBatchWork():
     def output_dir(self):
         #-o Output directory args is not required
         self.run.info('Data directory', self.output_directory)
-        if self.output_directory:
-            filesnpaths.is_output_dir_writable(os.path.dirname(os.path.abspath(self.output_directory)))
-            filesnpaths.check_output_directory(self.output_directory)
+        is_writable = filesnpaths.is_output_dir_writable(os.path.dirname(os.path.abspath(self.output_directory)))
+        if self.output_directory and is_writable:
             filesnpaths.gen_output_directory(self.output_directory)
 
 

@@ -21,7 +21,7 @@ __credits__ = []
 __license__ = "GPL 3.0"
 __version__ = anvio.__version__
 __authors__ = ['metehan']
-__requires__ = ['contigs-db', 'profile-db']
+__requires__ = ['yaml']
 __description__ = (
     "The purpose of this program is to download the data in the Yaml type file received from the user and run the desired commands.")
 
@@ -39,7 +39,7 @@ if __name__ == '__main__':
                             "This is particularly useful if you wish to play with general anvi'o output files"}), required=False)    
     parser.add_argument(*anvio.A('reset'), **anvio.K('reset'))
     
-    args = parser.get_args(parser)
+    args = parser.get_args(parser, auto_fill_anvio_dbs=True)
 
     try:
         main(args)
