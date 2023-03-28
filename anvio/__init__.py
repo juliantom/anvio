@@ -3531,6 +3531,13 @@ D = {
             {'metavar': 'TEXT_FILE',
              'required': True,
              'help': "You have to provide a YAML file."}
+    ),
+    'rerun': (
+        ['--rerun', '-re'],
+        {'default': False,
+         'metavar': 'STATS',
+         'type': str,
+         'help': "If you installed the data already you can use rerun argument to skip setup commands."}
     )
 }
 
