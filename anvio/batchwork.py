@@ -42,6 +42,7 @@ class AnvioBatchWork():
         self.pan_db_path = A('pan_db')
         self.output_directory = A('output_dir')
         self.reset = A('reset')
+        self.rerun = A('rerun')
 
         if not skip_sanity_check:
             self.sanity_check()
@@ -95,15 +96,15 @@ class AnvioBatchWork():
         #If user give -o Output_Dir we will run under the directory
         if self.output_directory:
             os.chdir(self.output_directory)
-
-        while setup_command_counter < len(setup):
-            # In terminal use, we need to use `rm, cd commands`. But it is not secure in Anviserver. So we will check when the form is uploaded to the Anviserver.
-            try:
-                subprocess.run(str(setup[setup_command_counter]), shell=True)
-                setup_command_counter += 1   
-            except ConfigError as e:
-                print(e)
-                sys.exit(-1)
+        if not self.rerun:
+            while setup_command_counter < len(setup):
+                # In terminal use, we need to use `rm, cd commands`. But it is not secure in Anviserver. So we will check when the form is uploaded to the Anviserver.
+                try:
+                    subprocess.run(str(setup[setup_command_counter]), shell=True)
+                    setup_command_counter += 1   
+                except ConfigError as e:
+                    print(e)
+                    sys.exit(-1)
 
 
     def run_commands(self):

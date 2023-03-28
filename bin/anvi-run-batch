@@ -38,6 +38,7 @@ if __name__ == '__main__':
                             "stored in there, instead of being stored in a temporary directory to be deleted once the tests are done. "
                             "This is particularly useful if you wish to play with general anvi'o output files"}), required=False)    
     parser.add_argument(*anvio.A('reset'), **anvio.K('reset'))
+    parser.add_argument(*anvio.A('rerun'), **anvio.K('rerun'))
     
     args = parser.get_args(parser, auto_fill_anvio_dbs=True)
 
