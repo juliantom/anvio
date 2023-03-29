@@ -3535,10 +3535,9 @@ D = {
     'rerun': (
         ['--rerun', '-re'],
         {'default': False,
-         'metavar': 'STATS',
-         'type': str,
-         'help': "If you installed the data already you can use rerun argument to skip setup commands."}
-    )
+         'action': 'store_true',
+         'help': "If you installed the data already you can use rerun argument to skip"}
+    ),
 }
 
 # two functions that works with the dictionary above.
