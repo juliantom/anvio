@@ -212,9 +212,9 @@ function loadAll() {
 
                 $('#range-box').append(`<div style="display: inline-block; margin-bottom:10px;" class="form-inline"> \
                                         Selection range from
-                                            <input class="form-control input-sm" id="brush_start" type="text" value="0" size="5">
+                                            <input class="form-control input-xs col-4" id="brush_start" type="text" value="0" size="3">
                                         to
-                                            <input class="form-control input-sm" id="brush_end" type="text" value="${sequence.length}" size="5">\
+                                            <input class="form-control input-xs col-4" id="brush_end" type="text" value="${sequence.length}" size="3">\
                                     </div>`);
 
                 info("Checking for gene functional annotations");
@@ -950,7 +950,7 @@ function display_nucleotides() {
   var dna_seq_height = contextSvg.select("#DNA_sequence")[0][0].getBBox().height;
   var nucl_text_y = .75*dna_seq_height;
                    nucl_sequence.attr("y", nucl_text_y)
-                                .attr("font-family", "monospace")
+                                .attr("font-family", 'Montserrat', "monospace")
                                 .attr("transform", "translate(" + (margin.left) + ", 10)");
 
   var show_AAs = false;
@@ -1023,7 +1023,7 @@ function display_nucleotides() {
         aa_sequence.append("text")
                   .text(aa_string)
                   .attr('font-size', nucl_text_font)
-                  .attr("font-family", "monospace")
+                  .attr("font-family", 'Montserrat', "monospace")
                   .attr("fill", "white")
                   .attr("x", buffer*textWidth)
                   .attr("y", dna_seq_height + .67*dna_seq_height + offset_y);

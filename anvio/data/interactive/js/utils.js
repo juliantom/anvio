@@ -410,14 +410,14 @@ function showDraggableDialog(title, content, updateOnly)
             <div class="modal-dialog" style="pointer-events: all;"> \
                 <div class="modal-content no-shadow"> \
                     <div class="modal-header"> \
+                        <h4 class="modal-title">' + title + '</h4> \
                         <button type="button" class="close" data-dismiss="modal" aria-hidden="true">&times;</button> \
-                         <h4 class="modal-title">' + title + '</h4> \
                     </div> \
                     <div class="modal-body"> \
                         ' + content + ' \
                     </div> \
                     <div class="modal-footer"> \
-                        <button type="button" class="btn btn-default" data-dismiss="modal">Close</button> \
+                        <button type="button" class="btn btn-outline-danger" data-dismiss="modal">Close</button> \
                     </div> \
                 </div> \
             </div> \
