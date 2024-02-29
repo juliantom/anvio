@@ -876,9 +876,9 @@ def is_all_submodules_present():
         return True
 
 
-def is_all_columns_present_in_TAB_delim_file(columns, file_path):
-    columns = get_columns_of_TAB_delim_file(file_path)
-    return False if len([False for c in columns if c not in columns]) else True
+def is_all_columns_present_in_TAB_delim_file(columns, file_path, including_first_column=False):
+    columns_in_file = get_columns_of_TAB_delim_file(file_path, include_first_column=including_first_column)
+    return False if len([False for c in columns if c not in columns_in_file]) else True
 
 
 def HTMLColorToRGB(colorstring, scaled=True):

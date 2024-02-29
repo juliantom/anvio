@@ -10,7 +10,11 @@ import os
 import json
 import math
 import copy
+import argparse
 import pandas as pd
+import networkx as nx
+import time
+
 from itertools import chain
 
 # multiprocess is a fork of multiprocessing that uses the dill serializer instead of pickle
@@ -30,6 +34,7 @@ import anvio.clustering as clustering
 import anvio.filesnpaths as filesnpaths
 import anvio.tables.miscdata as miscdata
 
+from anvio.dbinfo import DBInfo
 from anvio.drivers.blast import BLAST
 from anvio.drivers.diamond import Diamond
 from anvio.drivers.mcl import MCL
@@ -56,6 +61,7 @@ aligners = Aligners()
 
 additional_param_sets_for_sequence_search = {'diamond'   : '--masking 0',
                                              'ncbi_blast': ''}
+
 
 class Pangenome(object):
     def __init__(self, args=None, run=run, progress=progress):
@@ -1034,3 +1040,1070 @@ class Pangenome(object):
 
 
         self.run.quit()
+
+
+class Pangraph():
+    def __init__(self, args, run=run, progress=progress):
+        self.args = args
+        self.run = run
+        self.progress = progress
+
+        A = lambda x: args.__dict__[x] if x in args.__dict__ else None
+        self.pan_db = A('pan_db')
+        self.external_genomes_txt = A('external_genomes')
+        self.genomes_storage_db = A('genomes_storage')
+        self.max_edge_length_filter = A('max_edge_length_filter')
+        self.gene_cluster_grouping_threshold = A('gene_cluster_grouping_threshold')
+        self.debug = anvio.DEBUG
+
+        # data storage related variables
+        self.skip_storing_in_pan_db = True # FIXME: DB storage is not yet implemented
+        self.json_output_file_path = A('output_file')
+
+        # learn what gene annotation sources are present across all genomes
+        self.functional_annotation_sources_available = DBInfo(self.genomes_storage_db, expecting='genomestorage').get_functional_annotation_sources()
+
+        self.priority_genome = 'wPip'
+
+        # this is the dictionary that wil keep all data that is going to be loaded
+        # from anvi'o artifacts
+        self.gene_synteny_data_dict = {}
+        self.genome_coloring = {}
+
+        self.initial_graph = nx.DiGraph()
+        self.pangenome_graph = nx.DiGraph()
+        self.edmonds_graph = nx.DiGraph()
+        self.ancest = nx.DiGraph()
+
+        self.fusion_events = 0
+        self.removed_edges = 0
+
+        self.leaf_path = []
+        self.grouping = {}
+
+        self.global_y = 0
+        self.global_x = 1
+        self.k = 0
+        self.genome_gc_occurence = {}
+        self.ghost = 0
+        self.debug = False
+
+        self.position = {}
+        self.x_list = {}
+        self.path = {}
+        self.edges = []
+
+
+    def sanity_check(self):
+        if self.skip_storing_in_pan_db and not self.json_output_file_path:
+            raise ConfigError("You are initializing the Pangraph class with `--skip-storing-in-pan-db` without an `--output-file` "
+                              "parameter for the graph results to be stored. Please set an output file path so anvi'o has at least one "
+                              "way to store results.")
+
+        if self.json_output_file_path:
+            filesnpaths.is_output_file_writable(self.json_output_file_path)
+
+        if self.external_genomes_txt:
+            filesnpaths.is_file_tab_delimited(self.external_genomes_txt)
+
+            if not utils.is_all_columns_present_in_TAB_delim_file(["name","contigs_db_path"], self.external_genomes_txt, including_first_column=True):
+                raise ConfigError("Your external genomes file does not seem to contain that anvi'o expects to find "
+                                  "in an external genomes file :/")
+
+        # make sure the pan-db and genomes-storage-db are compatible
+        utils.is_pan_db_and_genomes_storage_db_compatible(self.pan_db, self.genomes_storage_db)
+
+
+    def process(self):
+        """Primary driver function for the class"""
+
+        # sanity check EVERYTHING
+        self.sanity_check()
+
+        # populate self.gene_synteny_data_dict
+        self.get_gene_synteny_data_dict()
+
+        # contextualize paralogs
+        # TODO Incorporate gene direction
+        self.run_contextualize_paralogs_algorithm()
+
+        # build graph
+        self.build_graph()
+
+        # reconnect open leaves in the graph to generate
+        # a flow network from left to right
+        self.run_tree_to_flow_network_algorithm()
+        
+        # run Alex's layout algorithm
+        self.run_synteny_layout_algorithm()
+
+        # store network in the database
+        self.store_network()
+
+
+    def get_gene_synteny_data_dict(self):
+        """A function to roduce a comprehensive data structure from anvi'o artifacts for
+           downstream analyses.
+        """
+        self.run.warning(None, header="Loading data from database", lc="green")
+
+        pan_db = dbops.PanSuperclass(self.args, r=terminal.Run(verbose=False), p=terminal.Progress(verbose=False))
+
+        pan_db.init_gene_clusters()
+        pan_db.init_gene_clusters_functions_summary_dict()
+        gene_cluster_dict = pan_db.gene_callers_id_to_gene_cluster
+
+        external_genomes = pd.read_csv(self.external_genomes_txt, header=0, sep="\t", names=["name","contigs_db_path"])
+        external_genomes.set_index("name", inplace=True)
+
+        for genome, contigs_db_path in external_genomes.iterrows():
+
+            if genome not in self.genome_coloring.keys():
+                self.genome_coloring[genome] = "on"
+
+            if self.genome_coloring[genome] != "off":
+                args = argparse.Namespace(contigs_db=contigs_db_path.item())
+                contigs_db = dbops.ContigsSuperclass(args, r=terminal.Run(verbose=False), p=terminal.Progress(verbose=False))
+
+                caller_id_cluster = gene_cluster_dict[genome]
+                caller_id_cluster_df = pd.DataFrame.from_dict(caller_id_cluster, orient="index", columns=["gene_cluster_name"]).rename_axis("gene_caller_id").reset_index()
+                caller_id_cluster_df["gene_cluster_id"] = ""
+                caller_id_cluster_df["max_paralog"] = 0
+                caller_id_cluster_df["draw"] = self.genome_coloring[genome]
+
+                contigs_db.init_functions()
+                gene_function_calls_df = pd.DataFrame.from_dict(contigs_db.gene_function_calls_dict, orient="index", columns=self.functional_annotation_sources_available).rename_axis("gene_caller_id").reset_index()
+
+                all_gene_calls = caller_id_cluster_df['gene_caller_id'].values.tolist()
+                genes_in_contigs_df = pd.DataFrame.from_dict(contigs_db.get_sequences_for_gene_callers_ids(all_gene_calls, include_aa_sequences=True, simple_headers=True)[1], orient="index", columns=["contig", "start", "stop", "direction", "partial", "call_type", "source", "version", "sequence", "length", "rev_compd", "aa_sequence", "header"]).rename_axis("gene_caller_id").reset_index()
+
+                joined_contigs_df = caller_id_cluster_df.merge(genes_in_contigs_df, on="gene_caller_id", how="left").merge(gene_function_calls_df, on="gene_caller_id", how="left")
+                joined_contigs_df.sort_values(["contig", "start", "stop"], axis=0, ascending=True, inplace=True)
+                joined_contigs_df.set_index(["contig", "gene_caller_id"], inplace=True)
+
+                self.gene_synteny_data_dict[genome] = joined_contigs_df.fillna("None").groupby(level=0).apply(lambda df: df.xs(df.name).to_dict("index")).to_dict()
+
+            self.run.info_single(f"{contigs_db_path.item().split('/')[-1]}")
+
+        self.run.info_single("Done")
+
+
+    def run_contextualize_paralogs_algorithm(self):
+        """A function that resolves the graph context of paralogs based on gene synteny information across genomes"""
+        self.run.warning(None, header="Select paralog context", lc="green")
+
+        unresolved = True
+        solved = set()
+
+        genome_gc_order_values = {}
+        genome_gc_order_placeholder = {}
+
+        while unresolved:
+
+            unresolved = False
+            drop = set()
+
+            for genome in self.gene_synteny_data_dict.keys():
+                for contig in self.gene_synteny_data_dict[genome].keys():
+                    genome_gc_order = [self.gene_synteny_data_dict[genome][contig][gene_call]["gene_cluster_name"] for gene_call in self.gene_synteny_data_dict[genome][contig].keys()]
+
+                    if self.k == 0:
+                        if genome not in genome_gc_order_values:
+                            genome_gc_order_values[genome] = {contig: genome_gc_order}
+                            genome_gc_order_placeholder[genome] = {contig: ''}
+                        else:
+                            items = list(genome_gc_order_values[genome].values())
+                            times = items.count(genome_gc_order)
+                            if times == 0:
+                                genome_gc_order_values[genome][contig] = genome_gc_order
+                                genome_gc_order_placeholder[genome][contig] = ''
+                            else:
+                                genome_gc_order_values[genome][contig] = genome_gc_order
+                                genome_gc_order_placeholder[genome][contig] = chr(ord('a')+times-1)
+
+                    place = genome_gc_order_placeholder[genome][contig]
+
+                    for i in range(0, len(genome_gc_order)):
+
+                        start = (i - self.k) if (i - self.k) >= 0 else 0
+                        stop = (i + self.k + 1) if (i + self.k + 1) <= len(genome_gc_order) else len(genome_gc_order)
+                        entry = genome_gc_order[start:stop]
+                        # gene_call = genome_gc_order[i][1]
+                        # name = genome_gc_order[i][0]
+
+                        if len(entry) == 1 + (2 * self.k):
+                            gc_k = tuple(entry)
+                        elif start == 0 and stop == len(genome_gc_order):
+                            gc_k = tuple([place] * (self.k - i) + entry + [place] * ((i + self.k + 1) - len(genome_gc_order)))
+                        elif start == 0:
+                            gc_k = tuple([place] * (self.k - i) + entry)
+                        elif stop == len(genome_gc_order):
+                            gc_k = tuple(entry + [place] * ((i + self.k + 1) - len(genome_gc_order)))
+                        else:
+                            print("Sanity Error. Code 1.")
+                            exit()
+
+                        if len(gc_k) != 1 + (2 * self.k):
+                            print("Sanity Error. Code 2.")
+                            exit()
+
+                        gc = gc_k[int(len(gc_k) / 2)]
+                        if gc not in solved:
+                            
+                            if gc_k not in self.genome_gc_occurence.keys():
+                                self.genome_gc_occurence[gc_k] = {genome: 1}
+
+                            elif gc_k in self.genome_gc_occurence.keys():
+                                if genome not in self.genome_gc_occurence[gc_k].keys():
+                                    self.genome_gc_occurence[gc_k][genome] = 1
+                                else:
+                                    self.genome_gc_occurence[gc_k][genome] += 1
+
+                            else:
+                                # if genome not in self.genome_gc_occurence[gc_k[::-1]].keys():
+                                #     self.genome_gc_occurence[gc_k[::-1]][genome] = 1
+                                # else:
+                                #     self.genome_gc_occurence[gc_k[::-1]][genome] += 1
+                                print('Sanity Error. Code 3.')
+                                exit()
+
+            for gc, genome_gc_frequency in self.genome_gc_occurence.items():
+                if max(genome_gc_frequency.values()) > 1:
+
+                    unresolved = True
+                    drop.add(gc[int(len(gc)/2)])
+
+            # self.run.info_single(f"Iteration #{str(self.k)}: {pp(len(self.genome_gc_occurence))} GCs containing {len(drop)} paralogs")
+            
+            if self.k == 0:
+                self.paralog_dict = copy.deepcopy(self.genome_gc_occurence)
+
+            if unresolved:
+                keys = list(self.genome_gc_occurence.keys())
+                for gc in keys:
+                    if gc[int(len(gc)/2)] in drop:
+                        self.genome_gc_occurence.pop(gc)
+
+                solved = set([gc[int(len(gc)/2)] for gc in self.genome_gc_occurence.keys()])
+                self.k += 1
+
+        self.run.info_single(f"{pp(self.k+1)} iteration(s) to expand {pp(len(self.paralog_dict.keys()))} GCs to {pp(len(self.genome_gc_occurence.keys()))} GCs without paralogs")
+        syn_calls = 0
+        for genome in self.gene_synteny_data_dict.keys():
+
+            for contig in self.gene_synteny_data_dict[genome].keys():
+                genome_gc_order = [(self.gene_synteny_data_dict[genome][contig][gene_call]["gene_cluster_name"], gene_call) for gene_call in self.gene_synteny_data_dict[genome][contig].keys()]
+
+                place = genome_gc_order_placeholder[genome][contig]
+
+                for i in range(0, len(genome_gc_order)):
+                    start = i-self.k if i-self.k >= 0 else 0
+                    stop = i+self.k+1 if i+self.k+1 <= len(genome_gc_order) else len(genome_gc_order)
+                    entry = [item[0] for item in genome_gc_order[start:stop]]
+                    gene_call = genome_gc_order[i][1]
+                    name = genome_gc_order[i][0]
+
+                    if len(entry) == 1 + (2 * self.k):
+                        gc_k = tuple(entry)
+                    elif start == 0 and stop == len(genome_gc_order):
+                        gc_k = tuple([place] * (self.k - i) + entry + [place] * ((i + self.k + 1) - len(genome_gc_order)))
+                    elif start == 0:
+                        gc_k = tuple([place] * (self.k - i) + entry)
+                    elif stop == len(genome_gc_order):
+                        gc_k = tuple(entry + [place] * ((i + self.k + 1) - len(genome_gc_order)))
+                    else:
+                        print("Sanity Error. Code 4.")
+                        exit()
+
+                    for j in range(0, self.k+1):
+
+                        gc_group = gc_k[int(len(gc_k)/2)-j:int(len(gc_k)/2)+j+1]
+
+                        if gc_group in self.genome_gc_occurence.keys():
+
+                            self.gene_synteny_data_dict[genome][contig][gene_call]["gene_cluster_id"] = ','.join(gc_group)
+                            self.gene_synteny_data_dict[genome][contig][gene_call]["max_paralog"] = self.paralog_dict[tuple([name])][genome]
+                            syn_calls += 1
+                            break
+
+                        else:
+                            pass
+
+        num_calls = 0
+        for _, value in self.genome_gc_occurence.items():            
+            num_calls += sum(value.values()) 
+
+        if num_calls != syn_calls:
+            print("Sanity Error. Code 5.")
+            exit()
+
+        self.run.info_single("Done")
+
+    def add_node_to_graph(self, gene_cluster, name, info):
+
+        if not self.initial_graph.has_node(gene_cluster):
+            self.initial_graph.add_node(
+                gene_cluster,
+                name=name,
+                pos=(0, 0),
+                weight=1,
+                genome=info
+            )
+
+        else:
+            self.initial_graph.nodes[gene_cluster]['weight'] += 1
+            self.initial_graph.nodes[gene_cluster]['genome'].update(info)
+
+
+    def add_edge_to_graph(self, gene_cluster_i, gene_cluster_j, info):
+
+        if self.priority_genome in info.keys():
+            weight_add = 10
+        else:
+            weight_add = 0
+
+        draw = {genome: {y: info[genome][y] for y in info[genome].keys() if y == 'draw'} for genome in info.keys()}
+
+        if not self.initial_graph.has_edge(*(gene_cluster_i, gene_cluster_j)):
+            self.initial_graph.add_edge(
+                *(gene_cluster_i, gene_cluster_j),
+                weight=1 + weight_add,
+                genome=draw,
+                bended=[],
+                direction='R'
+            )
+
+        else:
+            self.initial_graph[gene_cluster_i][gene_cluster_j]['weight'] += 1 + weight_add
+            self.initial_graph[gene_cluster_i][gene_cluster_j]['genome'].update(draw)
+
+    # TODO Should reverse genes also be connected in reverse?
+    def build_graph(self):
+        """FIXME"""
+
+        self.run.warning(None, header="Building directed gene cluster graph G", lc="green")
+
+        for genome in self.gene_synteny_data_dict.keys():
+
+            for contig in self.gene_synteny_data_dict[genome].keys():
+                gene_cluster_kmer = []
+                for gene_call in self.gene_synteny_data_dict[genome][contig].keys():
+                    gene_cluster_kmer.append((self.gene_synteny_data_dict[genome][contig][gene_call]['gene_cluster_id'], self.gene_synteny_data_dict[genome][contig][gene_call]['gene_cluster_name'], {genome: {'contig':contig, 'gene_call':gene_call, **self.gene_synteny_data_dict[genome][contig][gene_call]}}))
+
+                if len(gene_cluster_kmer) > 1:
+                    gene_cluster_pairs = map(tuple, zip(gene_cluster_kmer, gene_cluster_kmer[1:]))
+                    first_pair = next(gene_cluster_pairs)
+
+                    self.add_node_to_graph(first_pair[0][0], first_pair[0][1], first_pair[0][2])
+                    self.add_node_to_graph(first_pair[1][0], first_pair[1][1], first_pair[1][2])
+                    self.add_edge_to_graph(first_pair[0][0], first_pair[1][0], first_pair[1][2])
+
+                    for gene_cluster_pair in gene_cluster_pairs:
+
+                        self.add_node_to_graph(gene_cluster_pair[1][0], gene_cluster_pair[1][1], gene_cluster_pair[1][2])
+                        self.add_edge_to_graph(gene_cluster_pair[0][0], gene_cluster_pair[1][0], gene_cluster_pair[1][2])
+
+                else:
+                    self.add_node_to_graph(gene_cluster_kmer[0][0], gene_cluster_kmer[0][1], gene_cluster_kmer[0][2])
+
+        self.run.info_single(f"Adding {pp(len(self.initial_graph.nodes()))} nodes and {pp(len(self.initial_graph.edges()))} edges to G")
+        connectivity = nx.is_connected(self.initial_graph.to_undirected())
+        self.run.info_single(f"Connectivity is {connectivity}")
+
+        if connectivity == False:
+            self.pangenome_graph = nx.DiGraph(self.initial_graph.subgraph(max(nx.weakly_connected_components(self.initial_graph), key=len)))
+            self.run.info_single(f"Keeping Subgraph with {pp(len(self.pangenome_graph.nodes()))} nodes and {pp(len(self.pangenome_graph.edges()))} edges")
+
+            connectivity = nx.is_connected(self.pangenome_graph.to_undirected())
+            self.run.info_single(f"Connectivity is {connectivity}")
+        else:
+            self.pangenome_graph = nx.DiGraph(self.initial_graph)
+
+        self.run.info_single("Done")
+
+        self.run.warning(None, header="Building maximum branching graph M of G", lc="green")
+
+        add_start = []
+        for node in self.pangenome_graph.nodes():
+            if len(list(self.pangenome_graph.predecessors(node))) == 0:
+                add_start.append(node)
+
+        self.pangenome_graph.add_node(
+            'start',
+            name='start',
+            pos=(0, 0),
+            weight=len(self.genome_coloring.keys()),
+            genome={genome: {'draw': 'on'} for genome in self.genome_coloring.keys()}
+        )
+
+        for u in add_start:
+
+            weight = self.pangenome_graph.nodes[u]['weight']
+            genomes = self.pangenome_graph.nodes[u]['genome'].keys()
+
+            self.pangenome_graph.add_edge(
+                *('start', u),
+                genome={genome: {'draw': 'on'} for genome in genomes},
+                weight=weight,
+                bended=[],
+                direction='R'
+            )
+
+        selfloops = list(nx.selfloop_edges(self.pangenome_graph))
+        self.run.info_single(f"Found and removed {pp(len(selfloops))} selfloop edge(s)")
+        self.pangenome_graph.remove_edges_from(selfloops)
+
+        self.edmonds_graph = nx.algorithms.tree.branchings.maximum_spanning_arborescence(self.pangenome_graph, attr="weight")
+        nx.set_edge_attributes(self.edmonds_graph, {(i, j): d for i, j, d in self.pangenome_graph.edges(data=True) if (i, j) in self.edmonds_graph.edges()})
+        nx.set_node_attributes(self.edmonds_graph, {k: d for k, d in self.pangenome_graph.nodes(data=True) if k in self.edmonds_graph.nodes()})
+
+        self.run.info_single(f"Removing {pp(len(self.pangenome_graph.edges()) - len(self.edmonds_graph.edges()))} edges from G to create M")
+        self.run.info_single("Done")
+
+    def find_next_branching_point(self, current):
+        if current != 'start':
+            pred = list(self.edmonds_graph.predecessors(current))[0]
+            pred_successors = list(self.edmonds_graph.successors(pred))
+            if len(pred_successors) > 1:
+                return(pred)
+            else:
+                self.find_next_branching_point(pred)
+
+    def mean_edmonds_graph_path_weight(self, source, target):
+        path = nx.shortest_path(G=self.edmonds_graph, source=source, target=target, weight='weight')
+        path_weight = nx.path_weight(G=self.edmonds_graph, path=path, weight='weight')
+        return(path_weight)
+    
+    def get_edge(self, node_i, node_j, reverse = False):
+
+        if reverse == False:
+            pangenome_graph_edge_data = self.pangenome_graph.get_edge_data(node_i, node_j)
+            return(node_i, node_j, pangenome_graph_edge_data)
+        else:
+            pangenome_graph_edge_data = {y:z if y != 'direction' else 'L' for y,z in self.pangenome_graph.get_edge_data(node_i, node_j).items()}                           
+            return(node_j, node_i, pangenome_graph_edge_data)
+
+    def get_leaves(self, current_branch_successor, edmonds_graph_successors):
+        leaves = set()
+        while True:
+            successors = edmonds_graph_successors[current_branch_successor]
+
+            if successors:
+                if len(successors) > 1:
+                    for successor in successors:
+                        leaves.update(self.get_leaves(successor, edmonds_graph_successors))
+                    break
+                else:
+                    current_branch_successor = successors[0]
+            else:
+                leaves.update(set([current_branch_successor]))
+                break
+            
+        return(leaves)  
+
+    def edge_check(self, node_i, node_j, data):
+        
+        new_data = copy.deepcopy(data)
+
+        if self.edmonds_graph.has_edge(node_i, node_j):
+            old_data = self.edmonds_graph[node_i][node_j]
+            new_data['genome'].update(old_data['genome'])
+            new_data['weight'] += old_data['weight']
+            new_data['direction'] = 'B'
+        
+        return(new_data)
+
+    def run_tree_to_flow_network_algorithm(self):
+
+        self.run.warning(None, header="Building flow network F from M and G", lc="green")
+
+        edmonds_graph_edges = set(self.edmonds_graph.edges())
+        edmonds_graph_nodes = set(self.edmonds_graph.nodes())
+
+        pangenome_graph_edges = set(self.pangenome_graph.edges())
+        pangenome_graph_nodes = set(self.pangenome_graph.nodes())
+
+        edmonds_graph_removed_edges = pangenome_graph_edges - edmonds_graph_edges
+        edmonds_graph_end = max([(self.mean_edmonds_graph_path_weight('start', node), node) for node in edmonds_graph_nodes if len(list(self.pangenome_graph.successors(node))) == 0])[1]
+
+        for graph in [self.pangenome_graph, self.edmonds_graph]:
+
+            graph.add_node(
+                'stop',
+                name='stop',
+                pos=(0, 0),
+                weight=len(self.genome_coloring.keys()),
+                genome={genome: {'draw': 'on'} for genome in self.genome_coloring.keys()}
+            )
+            graph.add_edge(
+                *(edmonds_graph_end, 'stop'),
+                genome={genome: {'draw': 'on'} for genome in self.genome_coloring.keys()},
+                weight=len(self.genome_coloring.keys()),
+                bended=[],
+                direction='R'
+            )
+
+        edmonds_graph_nodes.add('stop')
+        edmonds_graph_predecessors = {edmonds_graph_node: list(self.edmonds_graph.predecessors(edmonds_graph_node))[0] for edmonds_graph_node in edmonds_graph_nodes if edmonds_graph_node != 'start'}
+        edmonds_graph_successors = {edmonds_graph_node: list(self.edmonds_graph.successors(edmonds_graph_node)) for edmonds_graph_node in edmonds_graph_nodes}
+        pangenome_graph_successors = {pangenome_graph_node: list(self.pangenome_graph.successors(pangenome_graph_node)) for pangenome_graph_node in pangenome_graph_nodes}
+        edmonds_graph_distances = {edmonds_graph_node: self.mean_edmonds_graph_path_weight('start', edmonds_graph_node) for edmonds_graph_node in edmonds_graph_nodes}
+
+        i = 0
+        resolved_nodes = set(['stop'])
+
+        pred = ''
+        x = 0
+        self.progress.new("Solving complex graph")
+        while len(resolved_nodes) != len(pangenome_graph_nodes) + 1 or x < 1:
+            if len(resolved_nodes) == len(pangenome_graph_nodes) + 1:
+                x += 1
+            
+            i += 1
+            
+            visited_nodes = set(['stop'])
+            current_node = 'stop'
+            while len(visited_nodes) != len(pangenome_graph_nodes) + 1:
+            
+                self.progress.update(f"{str(len(resolved_nodes)).rjust(len(str(len(pangenome_graph_nodes) + 1)), ' ')} / {len(pangenome_graph_nodes) + 1}")
+
+                if pred:
+                    current_branch_root = pred
+                    pred = ''
+                else:
+                    current_branch_root = edmonds_graph_predecessors[current_node]
+                
+                current_forward_connected = []
+                current_backward_connected = []
+                successor_branch_leaves = set()
+            
+                for current_branch_successor in edmonds_graph_successors[current_branch_root]:
+                    if current_branch_successor not in visited_nodes and current_branch_successor != current_node:
+                        successor_branch_leaves.update(self.get_leaves(current_branch_successor, edmonds_graph_successors))
+
+                if not successor_branch_leaves:
+                    current_node = current_branch_root
+                else:
+                    current_node = max([(edmonds_graph_distances[successor_branch_leaf], successor_branch_leaf) for successor_branch_leaf in successor_branch_leaves])[1]
+            
+                if current_node in resolved_nodes:
+                    connected = True
+                else:
+                    connected = False
+                
+                if connected != True or x == 1:
+                    for current_node_successor in pangenome_graph_successors[current_node]:
+                        
+                        if current_node_successor in resolved_nodes:
+
+                            if current_node_successor in nx.ancestors(self.edmonds_graph, current_node) or current_node_successor not in visited_nodes:
+                                if (current_node, current_node_successor) in edmonds_graph_removed_edges:
+                                    current_backward_connected.append(current_node_successor)
+                                    
+                            else:
+                                if (current_node, current_node_successor) in edmonds_graph_removed_edges:
+                                    current_forward_connected.append(current_node_successor)
+                                    connected = True
+                
+                                else:
+                                    connected = True
+                
+                    if connected == False:
+                        if len(list(self.pangenome_graph.successors(current_node))) == 0:
+                            pangenome_graph_edge_data = {
+                                'genome':{genome: {'draw': 'on'} for genome in self.genome_coloring.keys()},
+                                'weight':len(self.genome_coloring.keys()),
+                                'bended': [],
+                                'direction': 'R'
+                            }
+                        
+                            new_data = self.edge_check(current_node, 'stop', pangenome_graph_edge_data)
+                            self.edmonds_graph.add_edge(current_node, 'stop', **new_data)
+                            connected = True
+                
+                    if connected == True:
+                        for current_forward in current_forward_connected:
+                            node_i, node_j, data = self.get_edge(current_node, current_forward, reverse = False)
+                            
+                            new_data = self.edge_check(node_i, node_j, data)
+                            self.edmonds_graph.add_edge(node_i, node_j, **new_data)
+                            edmonds_graph_removed_edges.remove((current_node, current_forward))
+                            
+                        for current_backward in current_backward_connected:
+                            node_i, node_j, data = self.get_edge(current_node, current_backward, reverse = True)
+
+                            new_data = self.edge_check(node_i, node_j, data)
+                            self.edmonds_graph.add_edge(node_i, node_j, **new_data)
+                            edmonds_graph_removed_edges.remove((current_node, current_backward))
+                            
+                        resolved_nodes.add(current_node)
+                
+                    else:
+                        if current_backward_connected:
+                
+                            # number = random.randint(0,len(current_backward_connected)-1)
+                            number = max([(self.pangenome_graph.get_edge_data(current_node, backward)['weight'], i) for (i, backward) in enumerate(current_backward_connected)])[1]
+
+                            node_i, node_j, data = self.get_edge(current_node, current_backward_connected[number], reverse = True)
+                            self.edmonds_graph.remove_edge(edmonds_graph_predecessors[current_node], current_node)
+
+                            new_data = self.edge_check(node_i, node_j, data)
+                            self.edmonds_graph.add_edge(node_i, node_j, **new_data)
+                            
+                            edmonds_graph_removed_edges.remove((current_node, current_backward_connected[number]))
+                            edmonds_graph_removed_edges.add((edmonds_graph_predecessors[current_node], current_node))
+                
+                            edmonds_graph_successors[edmonds_graph_predecessors[current_node]].remove(current_node)
+                            edmonds_graph_successors[current_backward_connected[number]] += [current_node]
+
+                            pred = edmonds_graph_predecessors[current_node]
+
+                            edmonds_graph_predecessors.pop(current_node, None)
+                            edmonds_graph_predecessors[current_node] = current_backward_connected[number] 
+                
+                            edmonds_graph_distances[current_node] = self.mean_edmonds_graph_path_weight('start', current_node)
+                
+                            resolved_nodes.add(current_node)
+                            
+                            # break
+            
+                visited_nodes.add(current_node)
+            
+                if not nx.is_directed_acyclic_graph(self.edmonds_graph):
+                    print('Sanity Error. Code 6.')
+                    exit()
+
+        self.progress.end()
+
+        remaining_stops = [node for node in self.edmonds_graph.nodes() if self.edmonds_graph.out_degree(node) == 0 and node != 'stop']
+        self.run.info_single(f"{pp(i)} iterations to solve the graph") 
+
+        for stop in remaining_stops:
+
+            pangenome_graph_edge_data = {
+                'genome':{genome: {'draw': 'on'} for genome in self.genome_coloring.keys()},
+                'weight':len(self.genome_coloring.keys()),
+                'bended': [],
+                'direction': 'R'
+            }
+
+            new_data = self.edge_check(stop, 'stop', pangenome_graph_edge_data)
+            self.edmonds_graph.add_edge(stop, 'stop', **new_data)
+
+            edmonds_graph_successors[stop] += ['stop']
+
+        if not nx.is_directed_acyclic_graph(self.edmonds_graph):
+            print('Sanity Error. Code 7.')
+            exit()
+
+        self.run.info_single("Done")
+
+    def run_synteny_layout_algorithm(self):
+
+        self.run.warning(None, header="Calculating coordinates on the nodes from F", lc="green")
+
+        # for x, generation in enumerate(nx.topological_generations(self.edmonds_graph)):
+        #     self.x_list[x] = generation
+        #     for node in generation:
+        #         self.position[node] = (x, -1)
+
+        for x, generation in enumerate(nx.topological_generations(self.edmonds_graph)):
+            nodes = {}
+            self.x_list[x] = []
+            for node in generation:
+                node_list = node.split(',')
+
+                if node_list[int(len(node_list)/2)] in nodes.keys():
+
+                    found = False
+                    for contractor in nodes[node_list[int(len(node_list)/2)]]:
+
+                        intersection = set(self.edmonds_graph.nodes()[contractor]['genome'].keys()).intersection(set(self.edmonds_graph.nodes()[node]['genome'].keys()))
+                        if not intersection:
+
+                            self.edmonds_graph.nodes()[contractor]['weight'] += self.edmonds_graph.nodes()[node]['weight']
+                            self.edmonds_graph.nodes()[contractor]['genome'].update(self.edmonds_graph.nodes()[node]['genome'])
+
+                            nx.contracted_nodes(self.edmonds_graph, contractor, node, copy=False)
+                            nx.contracted_nodes(self.pangenome_graph, contractor, node, copy=False)
+
+                            self.fusion_events += 1
+                            found = True
+                            break
+
+                    if found == False:
+                        nodes[node_list[int(len(node_list)/2)]] += [node]
+                        self.x_list[x].append(node)
+                        self.position[node] = (x, -1)
+
+                else:
+                    nodes[node_list[int(len(node_list)/2)]] = [node]
+                    self.x_list[x].append(node)
+                    self.position[node] = (x, -1)
+            
+        self.global_x = x
+
+        self.ancest = nx.DiGraph(self.edmonds_graph)
+        nx.set_edge_attributes(self.ancest, values=-1, name='weight')
+        # self.ancest.remove_node('stop')
+        layout_graph_nodes = list(self.ancest.nodes())
+        layout_graph_successors = {layout_graph_node: list(self.ancest.successors(layout_graph_node)) for layout_graph_node in layout_graph_nodes}
+
+        removed = set()
+        n_removed = 0
+        ghost = 0
+        for x in range(self.global_x-1, 0, -1):
+            for node in self.x_list[x]:
+                node_x_position = self.position[node][0]
+
+                change = []
+                for successor in layout_graph_successors[node]:
+                    if successor != 'stop':
+                        successor_x_position = self.position[successor][0]
+                        
+                        if successor_x_position <= node_x_position:
+                            print('Sanity Error. Code 8.')
+                            exit()
+                        else:
+                            change.append((successor_x_position, successor))
+
+                if change:
+                    if min(change)[0] > 1:
+                        new_x_position = min([(x, n) for (x, n) in change if x > 1])[0] - 1
+                        self.position[node] = (new_x_position, -1)
+
+                    for (position, extend_successor) in change:
+                        x_difference = position - new_x_position
+
+                        if x_difference <= self.max_edge_length_filter or self.max_edge_length_filter == -1:
+
+                            path_list = [node]
+
+                            for i in range(1, x_difference):
+                                path_list += ['Ghost_' + str(ghost)]
+                                self.position['Ghost_' + str(ghost)] = (new_x_position + i, -1)
+                                ghost += 1
+
+                            path_list += [extend_successor]
+
+                            self.ancest.remove_edge(node, extend_successor)
+
+                            self.edges.append(path_list)
+
+                            if len(path_list) == 2:
+                                self.ancest.add_edges_from(map(tuple, zip(path_list, path_list[1:])), weight=-1)
+                            else:
+                                self.ancest.add_edges_from(map(tuple, zip(path_list, path_list[1:])), weight=-0.5)
+
+                        else:
+                            n_removed += 1
+                            # small change here, adding to set instead of removing directly from edmonds and ancest
+                            removed.add((node, extend_successor))
+
+        for i, j in self.ancest.edges():
+
+            if self.position[j][0] - self.position[i][0] != 1 and i != 'start' and j != 'stop' and (i,j) not in removed:
+                print('Sanity Error. Code 9.')
+                exit()
+
+        self.run.info_single(f"{self.fusion_events} fusion events.")
+
+        if self.max_edge_length_filter == -1:
+            self.run.info_single("Setting algorithm to 'keep all edges'")
+        else:
+            self.run.info_single(f"Setting algorithm to 'max edge length < {pp(self.max_edge_length_filter)}'")
+
+        self.run.info_single(f"Removed {pp(n_removed)} edge(s) due to length cutoff")
+
+        longest_path = nx.bellman_ford_path(G=self.ancest, source='start', target='stop', weight='weight')
+        # print(longest_path)
+        
+        m = set(longest_path)
+
+        # starts = [node for node in self.ancest.nodes() if self.ancest.in_degree(node) == 0]
+        # dfs_list = list(nx.edge_dfs(self.ancest, source=starts))
+
+        starts = [node for node in self.ancest.nodes() if self.ancest.in_degree(node) == 0 if node != 'start']
+        for st in starts:
+            self.ancest.add_edge('start', st, weight=-1)
+        dfs_list = list(nx.dfs_edges(self.ancest, source='start'))
+        
+        group = 0
+        # degree = dict(self.ancest.degree())
+        groups = {}
+        groups_rev = {}
+
+        # TODO Currently no seperation between unequal genome context
+        if self.gene_cluster_grouping_threshold == -1:
+            self.run.info_single("Setting algorithm to 'no grouping'")
+        else:
+            self.run.info_single(f"Setting algorithm to 'Grouping single connected chains size > {pp(self.gene_cluster_grouping_threshold)}'")
+
+        for node_v, node_w in dfs_list:
+            if node_v != 'start' and self.ancest.in_degree(node_v) == 1 and self.ancest.out_degree(node_v) == 1 and self.ancest.in_degree(node_w) == 1 and self.ancest.out_degree(node_w) == 1:
+
+                if node_v not in groups_rev.keys():
+                    group_name = 'GCG_' + str(group).zfill(8)
+                    groups[group_name] = [node_v, node_w]
+                    groups_rev[node_v] = group_name
+                    groups_rev[node_w] = group_name
+                    group += 1
+
+                else:
+                    group_name = groups_rev[node_v]
+                    groups[group_name] += [node_w]
+                    groups_rev[node_w] = group_name
+
+        # print(len(sum(groups.values(), [])))
+        # for key in groups.keys():
+        #     if 'GC_00000628,GC_00000044,GC_00002584' in groups[key]:
+        #         print(groups[key])
+
+        for label, condense_nodes in groups.items():
+
+            condense_nodes = [node for node in condense_nodes if not node.startswith('Ghost_')]
+
+            if len(condense_nodes) >= self.gene_cluster_grouping_threshold and self.gene_cluster_grouping_threshold != -1:
+                self.grouping[label] = condense_nodes
+
+        self.run.info_single(f"Grouped {pp(len(sum(self.grouping.values(), [])))} nodes in {pp(len(self.grouping.keys()))} groups")
+
+        for st in starts:
+            self.ancest.remove_edge('start', st)
+
+        self.ancest.remove_edges_from(removed)
+        self.edmonds_graph.remove_edges_from(removed)
+
+        branches = {}
+        sortable = []
+        for g in groups.keys():
+            branch = groups[g]
+
+            if not set(branch).isdisjoint(m) and not set(branch).issubset(m):
+                print('Sanity Error. Code 10.')
+                break
+
+            elif set(branch).isdisjoint(m):
+
+                start = self.position[branch[0]][0]
+                length = len(branch)
+
+                if start in branches.keys():
+                    if length in branches[start].keys():
+                        if branches[start][length].keys():
+                            num = max(branches[start][length].keys()) + 1
+                        else:
+                            num = 1
+
+                        branches[start][length][num] = branch
+                    else:
+                        num = 1
+                        branches[start][length] = {num: branch}
+                else:
+                    num = 1
+                    branches[start] = {length: {num: branch}}
+
+                sortable += [(start, length, num)]
+
+
+        left_nodes = set(self.ancest.nodes()) - set(groups_rev.keys())
+        for n in left_nodes:
+
+            if not set([n]).isdisjoint(m) and not set([n]).issubset(m):
+                print('Sanity Error. Code 11.')
+                break
+
+            elif set([n]).isdisjoint(m):
+                start = self.position[n][0]
+                length = 1
+                if n != 'start' and n != 'stop':
+                    if start in branches.keys():
+                        if length in branches[start].keys():
+                            if branches[start][length].keys():
+                                num = max(branches[start][length].keys()) + 1
+                            else:
+                                num = 1
+
+                            branches[start][length][num] = [n]
+                        else:
+                            num = 1
+                            branches[start][length] = {num: [n]}
+                    else:
+                        num = 1
+                        branches[start] = {length: {num: [n]}}
+
+                    sortable += [(start, length, num)]
+
+        # print(sorted(sortable, key=lambda x: (x[0], x[1]), reverse = False))
+
+        used = set()
+        finished = set()
+
+        y_new = 0
+        for node in longest_path:
+            x_pos = self.position[node][0]
+            self.position[node] = (x_pos, y_new)
+            used.add((x_pos, y_new))
+            finished.add(node)
+
+        stack = [longest_path]
+        while stack:
+
+            current = stack[0]
+
+            remove = True
+            for i,j,k in sorted(sortable, key=lambda x: (x[1], x[0]), reverse = False):
+                branch = branches[i][j][k]
+                branch_pred = set(self.ancest.predecessors(branch[0]))
+                branch_succ = set(self.ancest.successors(branch[-1]))
+                # if (not branch_pred.isdisjoint(set(current)) and not branch_succ.isdisjoint(finished)) or (not branch_succ.isdisjoint(set(current)) and not branch_pred.isdisjoint(finished)) or (not branch_pred.isdisjoint(set(current)) and not branch_succ.isdisjoint(set(current))):
+                if (not branch_pred.isdisjoint(set(current))) or (not branch_succ.isdisjoint(set(current))) or (not branch_pred.isdisjoint(set(current)) and not branch_succ.isdisjoint(set(current))):
+
+                    remove = False
+                    sortable.remove((i,j,k))
+                    y_new = max(sum([[self.position[ypred][1] for ypred in branch_pred], [self.position[ysucc][1] for ysucc in branch_succ]], []))
+                        
+                    stack = [branch] + stack
+                    while True:
+                        repeat = False
+                        for xnew in range(i, i+j):
+                            if (xnew, y_new) in used:
+                                repeat = True
+
+                        if repeat == False:
+                            break
+                        else:
+                            y_new += 1
+
+                    for node in branch:
+                        x_pos = self.position[node][0]
+                        self.position[node] = (x_pos, y_new)
+                        used.add((x_pos, y_new))
+                        finished.add(node)
+
+                        self.global_y = y_new if y_new > self.global_y else self.global_y
+
+                    break
+
+            if remove == True:
+                stack.remove(current)
+
+        if len(set(self.position.values())) != len(self.position.values()):
+            print(len(self.position.values()) - len(set(self.position.values())))
+            print('Sanity Error. Code 12.')
+            exit()
+
+        nx.set_edge_attributes(self.ancest, {(i, j): d for i, j, d in self.edmonds_graph.edges(data=True)})
+
+        for edge in self.edges:            
+            self.ancest.add_edge(edge[0], edge[-1], **self.edmonds_graph[edge[0]][edge[-1]])
+            self.ancest[edge[0]][edge[-1]]['bended'] = [self.position[p] for p in edge[1:-1]]
+            self.ancest.remove_nodes_from(edge[1:-1])
+
+        nx.set_node_attributes(self.ancest, {k: d for k, d in self.edmonds_graph.nodes(data=True)})
+
+        for node in self.ancest.nodes():
+            self.ancest.nodes[node]['pos'] = self.position[node]
+
+        # self.ancest.remove_edge('start', 'stop')
+        # self.ancest.remove_nodes_from(['start', 'stop'])
+
+        self.run.info_single(f"Final graph {pp(len(self.ancest.nodes()))} nodes and {pp(len(self.ancest.edges()))} edges")
+        self.run.info_single(f"Done")
+
+    def get_json_dict_for_graph(self):
+        self.run.warning(None, header="Exporting network to JSON", lc="green")
+
+        jsondata = {}
+
+        # instances_pangenome_graph = 0
+        # for node, attr in self.pangenome_graph.nodes(data=True):
+        #     instances_pangenome_graph += len(list(attr['genome'].keys()))
+
+        # instances_ancest_graph = 0
+        # for node, attr in self.ancest.nodes(data=True):
+        #     instances_ancest_graph += len(list(attr['genome'].keys()))
+
+        instances_pangenome_graph = 0
+        for node, attr in self.pangenome_graph.nodes(data=True):
+            if node != 'start' and node != 'stop':
+                instances_pangenome_graph += len(list(attr['genome'].keys()))
+
+        instances_ancest_graph = 0
+        for node, attr in self.ancest.nodes(data=True):
+            if node != 'start' and node != 'stop':
+                instances_ancest_graph += len(list(attr['genome'].keys()))
+
+        self.run.info_single(f"Total fraction of recovered genecall information {round((instances_ancest_graph/instances_pangenome_graph)*100, 3)}%")
+        self.run.info_single(f"Total fraction of recovered geneclusters {round((len(self.ancest.nodes())-2)/(len(self.pangenome_graph.nodes())-2)*100, 3)}%")
+
+        # NOTE: Any change in `jsondata` will require the pangraph JSON in anvio.tables.__init__
+        #       to incrase by one (so that the new code that works with the new structure requires
+        #       previously generated JSON to be recomputed).
+        jsondata["infos"] = {'meta': {'version': anvio.__pangraph__version__,
+                                      'global_x': self.global_x,
+                                      'global_y': self.global_y},
+                             'genomes': self.genome_coloring,
+                             'functional_annotation_sources_available': self.functional_annotation_sources_available,
+                             'num_genomes': len(self.genome_coloring),
+                             'max_edge_length_filter': self.max_edge_length_filter,
+                             'gene_cluster_grouping_threshold': self.gene_cluster_grouping_threshold,
+                             'original': {'nodes': len(self.pangenome_graph.nodes()),
+                                          'edges': len(self.pangenome_graph.edges()),
+                                          'instances': instances_pangenome_graph},
+                             'visualization': {'nodes': len(self.ancest.nodes()),
+                                               'edges': len(self.ancest.edges()),
+                                               'instances': instances_ancest_graph},
+                             'data': list(self.ancest.graph.items()),
+                             'directed': self.ancest.is_directed(),
+                             'groups': self.grouping}
+
+        jsondata['infos']['grouped'] = {'nodes': len(self.ancest.nodes()), 'edges': len(self.ancest.edges())}
+
+        jsondata["elements"] = {"nodes": {}, "edges": {}}
+
+        for i, j in self.ancest.nodes(data=True):
+            # if i != 'start' and i != 'stop':
+            jsondata["elements"]["nodes"][str(i)] = {
+                "name": j["name"],
+                "weight": j["weight"],
+                "genome": j["genome"],
+                "position": {
+                    'x': j['pos'][0],
+                    'y': j['pos'][1]
+                }
+            }
+
+        for l, (k, o, m) in enumerate(self.ancest.edges(data=True)):
+            # if k != 'start' and k != 'stop' and o != 'start' and o != 'stop':
+            jsondata["elements"]["edges"]['E_' + str(l).zfill(8)] = {
+                "source": k,
+                "target": o,
+                "shown": 1,
+                "genome": m["genome"],
+                "weight": m["weight"],
+                "direction": m["direction"],
+                "bended": [{'x': x, 'y': y} for x, y in m["bended"]] if len(m["bended"]) != 0 else ""
+            }
+
+        self.run.info_single("Done.")
+
+        return(jsondata)
+
+    def store_network(self):
+        """Function to store final graph structure in a pan-db and/or JSON flat text output file"""
+
+        if self.json_output_file_path:
+            with open(self.json_output_file_path, 'w') as output:
+                output.write(json.dumps(self.get_json_dict_for_graph(), indent=2))
+            self.run.info("JSON output file", os.path.abspath(self.json_output_file_path))
+        else:
+            self.run.info("JSON output file", "Skipped (but OK)", mc='red')
+
+        if not self.skip_storing_in_pan_db:
+            raise ConfigError("The storage of graph data in pan-db is not yet implemented :/")
+        else:
+            self.run.info("Into the pan-db", "Skipped (but OK)", mc='red')
+
+    def get_genome_gc_fused(self):
+        return(self.genome_gc_fused)
